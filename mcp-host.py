@@ -9,7 +9,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client, get_default_environment
 from mcp.types import Tool, CallToolResult
 
-from anthropic import Anthropic
+from anthropic import Anthropic, AsyncAnthropic
 from dotenv import load_dotenv
 
 load_dotenv()  # load environment variables from .env
@@ -306,7 +306,7 @@ class LLMManager:
             connection_manager: ConnectionManager instance to use
         """
         self.connection_manager = connection_manager
-        self.anthropic = Anthropic()
+        self.anthropic = AsyncAnthropic()
         
     def _format_tools_for_llm(self, server_tools: Dict[str, List[dict]]) -> List[dict]:
         """Format tools from multiple servers for LLM consumption.
@@ -340,54 +340,79 @@ class LLMManager:
         available_tools = self._format_tools_for_llm(
             self.connection_manager.get_all_tools())
 
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
+        # Initial Claude API call with streaming
+        stream = await self.anthropic.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=1000,
             messages=messages,
-            tools=available_tools
+            tools=available_tools,
+            stream=True
         )
 
         tool_results = []
         final_text = []
+        current_text = ""
 
-        for content in response.content:
-            if content.type == 'text':
-                final_text.append(content.text)
-            elif content.type == 'tool_use':
+        async for event in stream:
+            if event.type == "message_start":
+                continue
+            elif event.type == "content_block_start":
+                continue
+            elif event.type == "content_block_delta":
+                if event.delta.type == "text_delta":
+                    current_text += event.delta.text
+                    print(event.delta.text, end="", flush=True)
+            elif event.type == "content_block_stop":
+                if current_text:
+                    final_text.append(current_text)
+                    current_text = ""
+            elif event.type == "message_stop":
+                if current_text:
+                    final_text.append(current_text)
+                    current_text = ""
+            elif event.type == "tool_use":
                 # Parse server and tool name
-                server_name, tool_name = content.name.split('_', 1)
+                server_name, tool_name = event.tool_calls[0].name.split('_', 1)
                 
                 try:
                     client = self.connection_manager.get_client(server_name)
-                    result = await client.call_tool(tool_name, content.input)
+                    result = await client.call_tool(tool_name, event.tool_calls[0].parameters)
                     tool_results.append({
                         "server": server_name,
                         "tool": tool_name,
                         "result": result
                     })
-                    final_text.append(
-                        f"[Called {server_name}.{tool_name} with args {content.input}]")
+                    tool_result_text = f"\n[Called {server_name}.{tool_name} with args {event.tool_calls[0].parameters}]\n"
+                    final_text.append(tool_result_text)
+                    print(tool_result_text, end="", flush=True)
                     
                     # Continue conversation with tool results
-                    if hasattr(content, 'text') and content.text:
+                    if current_text:
                         messages.append({
                             "role": "assistant",
-                            "content": content.text
+                            "content": current_text
                         })
                     messages.append({
                         "role": "user",
                         "content": str(result.content)
                     })
                     
-                    # Get next response from Claude
-                    response = self.anthropic.messages.create(
+                    # Get next response from Claude with streaming
+                    stream = await self.anthropic.messages.create(
                         model="claude-3-5-sonnet-20241022",
                         max_tokens=1000,
-                        messages=messages
+                        messages=messages,
+                        stream=True
                     )
                     
-                    final_text.append(response.content[0].text)
+                    async for next_event in stream:
+                        if next_event.type == "content_block_delta" and next_event.delta.type == "text_delta":
+                            print(next_event.delta.text, end="", flush=True)
+                            current_text += next_event.delta.text
+                    
+                    if current_text:
+                        final_text.append(current_text)
+                        current_text = ""
                     
                 except Exception as e:
                     error_msg = f"\nError calling {server_name}.{tool_name}: {str(e)}"
